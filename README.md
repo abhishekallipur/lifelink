@@ -1,4 +1,4 @@
-🌐 LifeLink
+# 🌐 LifeLink <img src="lifelinkimage.png" alt="LifeLink Logo" width="40"/>
 
 💡 Because every second counts in a medical emergency.
 
