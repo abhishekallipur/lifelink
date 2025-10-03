@@ -1,0 +1,608 @@
+package com.emergency.medical
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.View
+import android.view.animation.AnimationUtils
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.emergency.medical.audio.EmergencyAudioManager
+import com.emergency.medical.bluetooth.BluetoothRelayManager
+import com.emergency.medical.data.EmergencyPayload
+import com.emergency.medical.data.LocationData
+import com.emergency.medical.data.DeviceInfo
+import com.emergency.medical.data.MedicalDataManager
+import com.emergency.medical.data.MedicalInfo
+import com.emergency.medical.data.MessageStatus
+import com.emergency.medical.data.MessageStatusManager
+import com.emergency.medical.databinding.ActivityMainSimpleBinding
+import com.emergency.medical.network.DashboardClient
+import com.emergency.medical.notifications.EmergencyNotificationManager
+import com.emergency.medical.transmission.MultiChannelTransmissionManager
+import com.emergency.medical.ui.MessageStatusAdapter
+import com.emergency.medical.utils.DeviceStatusMonitor
+import com.google.android.material.snackbar.Snackbar
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
+
+class MainActivityMinimal : AppCompatActivity() {
+    
+    companion object {
+        private const val TAG = "EmergencyMedicalRelay"
+    }
+    
+    private lateinit var binding: ActivityMainSimpleBinding
+    private lateinit var medicalDataManager: MedicalDataManager
+    private lateinit var deviceStatusMonitor: DeviceStatusMonitor
+    private lateinit var bluetoothRelayManager: BluetoothRelayManager
+    private lateinit var audioManager: EmergencyAudioManager
+    private lateinit var dashboardClient: DashboardClient
+    private lateinit var messageStatusManager: MessageStatusManager
+    private lateinit var messageStatusAdapter: MessageStatusAdapter
+    private lateinit var emergencyNotificationManager: EmergencyNotificationManager
+    private lateinit var multiChannelTransmissionManager: MultiChannelTransmissionManager
+    
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val uiScope = CoroutineScope(Dispatchers.Main + Job())
+    
+    // AtomicBoolean is used for thread-safe operations, preventing race conditions
+    private val isSendingEmergency = AtomicBoolean(false)
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.all { it.value }
+        if (allGranted) {
+            Log.i(TAG, "All permissions granted")
+            Toast.makeText(this, "✅ All permissions granted successfully", Toast.LENGTH_SHORT).show()
+            startDeviceStatusMonitoring()
+            checkLocationPermissionAndCapture()
+        } else {
+            val deniedPermissions = permissions.filter { !it.value }.keys
+            Log.w(TAG, "Permissions denied: ${deniedPermissions.joinToString()}")
+            Toast.makeText(this, "⚠️ Some permissions denied. App may not work properly.", Toast.LENGTH_LONG).show()
+            startDeviceStatusMonitoring()
+            checkLocationPermissionAndCapture()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        try {
+            Log.i(TAG, "LifeLink app starting")
+            
+            binding = ActivityMainSimpleBinding.inflate(layoutInflater)
+            setContentView(binding.root)
+            
+            // Initialize managers first
+            initializeManagers()
+            
+            // Set up user interface
+            setupUI()
+            
+            // Request permissions and start monitoring
+            requestPermissions()
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in onCreate", e)
+            Toast.makeText(this, "❌ Error starting app: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun initializeManagers() {
+        // Initialize components using singleton patterns where appropriate
+        medicalDataManager = MedicalDataManager.getInstance()
+        deviceStatusMonitor = DeviceStatusMonitor(this)
+        bluetoothRelayManager = BluetoothRelayManager(this)
+        audioManager = EmergencyAudioManager(this)
+        dashboardClient = DashboardClient()
+        messageStatusManager = MessageStatusManager.getInstance()
+        emergencyNotificationManager = EmergencyNotificationManager(this)
+        multiChannelTransmissionManager = MultiChannelTransmissionManager(this)
+    }
+
+    private fun setupUI() {
+        try {
+            Log.i(TAG, "Setting up user interface")
+            
+            // Load medical information and update UI
+            val medicalInfo = medicalDataManager.getMedicalInfo()
+            updateMedicalInfoDisplay(medicalInfo)
+            
+            // Set up SOS button with animation
+            binding.sosButton.setOnClickListener {
+                Log.i(TAG, "SOS button pressed")
+                val animationScale = AnimationUtils.loadAnimation(this, android.R.anim.fade_in)
+                binding.sosButton.startAnimation(animationScale)
+                handleEmergencyButtonPress()
+            }
+            
+            // Set up Siren button
+            binding.sirenButton.setOnClickListener {
+                Log.i(TAG, "Siren button pressed")
+                toggleSiren()
+            }
+            
+            // Set up blood group spinner
+            setupBloodGroupSpinner()
+            
+            // Set up medical info form listeners
+            setupMedicalFormListeners()
+            
+            // Set up message status adapter (if needed)
+            messageStatusAdapter = MessageStatusAdapter()
+            
+            // Start periodic UI updates
+            startPeriodicUIUpdates()
+            
+            Log.i(TAG, "✅ User interface setup completed")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error setting up UI", e)
+            throw e
+        }
+    }
+
+    private fun setupBloodGroupSpinner() {
+        try {
+            val bloodGroups = arrayOf("Select", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-")
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, bloodGroups)
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            binding.bloodGroupSpinner.adapter = adapter
+            
+            binding.bloodGroupSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                    if (position > 0) {
+                        val selectedBloodGroup = bloodGroups[position]
+                        saveBloodGroup(selectedBloodGroup)
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>) {}
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up blood group spinner", e)
+        }
+    }
+
+    private fun setupMedicalFormListeners() {
+        try {
+            // Set up text change listeners for medical form fields
+            binding.nameEditText.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    saveMedicalInfo()
+                }
+            }
+            
+            binding.ageEditText.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    saveMedicalInfo()
+                }
+            }
+            
+            binding.medicalConditionsEditText.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    saveMedicalInfo()
+                }
+            }
+            
+            binding.emergencyContactEditText.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    saveMedicalInfo()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting up medical form listeners", e)
+        }
+    }
+
+    private fun startPeriodicUIUpdates() {
+        uiScope.launch {
+            while (true) {
+                try {
+                    updateDeviceStatus()
+                    delay(5000) // Update every 5 seconds
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in periodic UI updates", e)
+                    delay(5000) // Continue even if there's an error
+                }
+            }
+        }
+    }
+
+    private fun requestPermissions() {
+        val requiredPermissions = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.BLUETOOTH,
+            Manifest.permission.BLUETOOTH_ADMIN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.ACCESS_WIFI_STATE,
+            Manifest.permission.CHANGE_WIFI_STATE,
+            Manifest.permission.INTERNET,
+            Manifest.permission.ACCESS_NETWORK_STATE
+        )
+        
+        val missingPermissions = requiredPermissions.filter { permission ->
+            ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
+        }
+        
+        if (missingPermissions.isNotEmpty()) {
+            Log.i(TAG, "Requesting permissions: ${missingPermissions.joinToString()}")
+            permissionLauncher.launch(missingPermissions.toTypedArray())
+        } else {
+            Log.i(TAG, "All permissions already granted")
+            startDeviceStatusMonitoring()
+            checkLocationPermissionAndCapture()
+        }
+    }
+
+    private fun startDeviceStatusMonitoring() {
+        try {
+            Log.i(TAG, "Device status monitoring ready")
+            // DeviceStatusMonitor doesn't have startMonitoring method
+            // It works on-demand via method calls
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting device monitoring", e)
+        }
+    }
+
+    private fun checkLocationPermissionAndCapture() {
+        try {
+            Log.i(TAG, "Testing location capture")
+            deviceStatusMonitor.getLastKnownLocation { locationData ->
+                if (locationData != null) {
+                    Log.i(TAG, "✅ Location available: ${locationData.latitude}, ${locationData.longitude}")
+                    updateEmergencyStatus("📍 Location: ${locationData.latitude}, ${locationData.longitude}", android.R.color.holo_green_dark)
+                } else {
+                    Log.w(TAG, "⚠️ No location data available")
+                    updateEmergencyStatus("📍 Location not available", android.R.color.holo_orange_dark)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error testing location capture", e)
+        }
+    }
+
+    private fun handleEmergencyButtonPress() {
+        // Use compareAndSet for atomic check-and-set operation to prevent double-sending
+        if (!isSendingEmergency.compareAndSet(false, true)) {
+            Log.w(TAG, "Emergency sending already in progress - ignoring button press")
+            return
+        }
+
+        try {
+            Log.i(TAG, "Emergency button pressed - starting emergency process")
+            val medicalInfo = medicalDataManager.getMedicalInfo()
+            
+            if (medicalInfo.fullName.isBlank() || medicalInfo.emergencyContact.isBlank()) {
+                Log.w(TAG, "Medical information incomplete")
+                updateEmergencyStatus("⚠️ Please complete medical information first", R.color.status_warning)
+                showErrorNotification("Medical Information Required", "Please complete your medical profile first")
+                isSendingEmergency.set(false)
+                return
+            }
+
+            val statusMessage = "Sending Emergency Alert..."
+            updateEmergencyStatus(statusMessage, R.color.status_warning)
+            binding.sosButton.isEnabled = false
+
+            deviceStatusMonitor.getLastKnownLocation { locationData ->
+                try {
+                    val deviceInfo = deviceStatusMonitor.getCurrentDeviceInfo()
+
+                    val emergencyPayload = EmergencyPayload(
+                        name = medicalInfo.fullName,
+                        age = medicalInfo.age.toIntOrNull(),
+                        phone = medicalInfo.emergencyContact,
+                        bloodGroup = medicalInfo.bloodGroup,
+                        phoneBattery = deviceInfo?.batteryLevel ?: 0,
+                        latitude = locationData?.latitude ?: 0.0,
+                        longitude = locationData?.longitude ?: 0.0,
+                        message = medicalInfo.medicalConditions.takeIf { it.isNotBlank() },
+                        currentMedicalIssue = medicalInfo.medicalConditions.takeIf { it.isNotBlank() },
+                        status = "Pending",
+                        priority = "Medium",
+                        notes = null,
+                        timestamp = java.time.Instant.now().toString(),
+                        solvedTimestamp = null,
+                        isRelay = false,
+                        relayCount = 0,
+                        originalSender = "EMG_${System.currentTimeMillis()}_${medicalInfo.fullName}",
+                        messageId = "EMG_${System.currentTimeMillis()}"
+                    )
+
+                    // Check internet status
+                    val internetAvailable = deviceStatusMonitor.isInternetAvailable()
+                    val networkType = deviceStatusMonitor.getNetworkType()
+
+                    if (internetAvailable && networkType != "None") {
+                        updateEmergencyStatus("📡 Sending via Internet ($networkType)...", R.color.status_sending)
+                        sendEmergencyViaDashboard(emergencyPayload)
+                    } else {
+                        updateEmergencyStatus("📻 No Internet - Using WiFi/Bluetooth backup...", R.color.status_sending)
+                        sendEmergencyViaBluetooth(emergencyPayload)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing location data", e)
+                    enableEmergencyButton()
+                    isSendingEmergency.set(false)
+                    updateEmergencyStatus("Error: ${e.message}", R.color.emergency_red)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling emergency button press", e)
+            enableEmergencyButton()
+            isSendingEmergency.set(false)
+            updateEmergencyStatus("Error: ${e.message}", R.color.emergency_red)
+        }
+    }
+
+    private fun sendEmergencyViaDashboard(payload: EmergencyPayload) {
+        try {
+            dashboardClient.sendEmergency(payload, object : DashboardClient.EmergencyCallback {
+                override fun onSuccess() {
+                    mainHandler.post {
+                        showSuccessNotification("Emergency Alert Sent Successfully", "Your emergency alert has been sent to the dashboard!")
+                        updateEmergencyStatus("✅ Emergency alert sent to dashboard!", android.R.color.holo_green_dark)
+                        updateLastEmergencyTime()
+                        enableEmergencyButton()
+                        isSendingEmergency.set(false)
+                    }
+                }
+
+                override fun onFailure(error: String) {
+                    mainHandler.post {
+                        updateEmergencyStatus("❌ Failed to send to dashboard: $error", android.R.color.holo_red_dark)
+                        enableEmergencyButton()
+                        isSendingEmergency.set(false)
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            enableEmergencyButton()
+            isSendingEmergency.set(false)
+            updateEmergencyStatus("❌ Error connecting to dashboard", android.R.color.holo_red_dark)
+        }
+    }
+
+    private fun sendEmergencyViaBluetooth(payload: EmergencyPayload) {
+        try {
+            bluetoothRelayManager.setCallback(object : BluetoothRelayManager.RelayCallback {
+                override fun onMessageReceived(payload: EmergencyPayload) {
+                    mainHandler.post { 
+                        updateEmergencyStatus("📨 Emergency received: ${payload.name}", android.R.color.holo_orange_dark) 
+                    }
+                }
+
+                override fun onMessageSent(success: Boolean, error: String?) {
+                    mainHandler.post {
+                        if (success) {
+                            showSuccessNotification("Emergency Alert Sent Successfully", "Your emergency alert has been sent via Bluetooth!")
+                            updateEmergencyStatus("✅ Emergency alert sent via Bluetooth!", android.R.color.holo_green_dark)
+                            updateLastEmergencyTime()
+                        } else {
+                            updateEmergencyStatus("⚠️ Bluetooth transmission issues: ${error ?: "Unknown error"}", android.R.color.holo_orange_dark)
+                        }
+                        enableEmergencyButton()
+                        isSendingEmergency.set(false)
+                    }
+                }
+
+                override fun onRelayForwarded(payload: EmergencyPayload) {
+                    mainHandler.post {
+                        showSuccessNotification("Relay Forwarded", "Emergency relay has been forwarded to nearby devices")
+                        updateEmergencyStatus("🔁 Relay forwarded: ${payload.originalSender}", android.R.color.holo_green_dark)
+                    }
+                }
+            })
+            
+            bluetoothRelayManager.broadcastEmergency(payload)
+        } catch (e: Exception) {
+            enableEmergencyButton()
+            updateEmergencyStatus("❌ Bluetooth transmission failed", android.R.color.holo_red_dark)
+            isSendingEmergency.set(false)
+        }
+    }
+
+    // Helper functions
+    private fun updateEmergencyStatus(message: String, colorResId: Int) {
+        try {
+            binding.emergencyStatus.text = message
+            binding.emergencyStatus.setTextColor(ContextCompat.getColor(this, colorResId))
+            Log.i(TAG, "Status updated: $message")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating emergency status", e)
+        }
+    }
+
+    private fun updateDeviceStatus() {
+        try {
+            val deviceInfo = deviceStatusMonitor.getCurrentDeviceInfo()
+            if (deviceInfo != null) {
+                binding.batteryStatus.text = "Battery: ${deviceInfo.batteryLevel}%"
+                
+                val networkType = deviceStatusMonitor.getNetworkType()
+                binding.internetStatus.text = "Network: $networkType"
+                
+                val bluetoothAdapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                val bluetoothStatus = when {
+                    bluetoothAdapter == null -> "Not supported"
+                    bluetoothAdapter.isEnabled -> "Enabled"
+                    else -> "Disabled"
+                }
+                binding.bluetoothStatus.text = "Bluetooth: $bluetoothStatus"
+                
+                // Update colors based on status
+                val networkColor = when (networkType) {
+                    "WiFi", "Mobile" -> android.R.color.holo_green_dark
+                    "None" -> android.R.color.holo_red_dark
+                    else -> android.R.color.holo_orange_dark
+                }
+                binding.internetStatus.setTextColor(ContextCompat.getColor(this, networkColor))
+                
+                val bluetoothColor = when (bluetoothStatus) {
+                    "Enabled" -> android.R.color.holo_green_dark
+                    "Disabled" -> android.R.color.holo_orange_dark
+                    else -> android.R.color.holo_red_dark
+                }
+                binding.bluetoothStatus.setTextColor(ContextCompat.getColor(this, bluetoothColor))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating device status", e)
+        }
+    }
+
+    private fun updateMedicalInfoDisplay(medicalInfo: MedicalInfo) {
+        try {
+            binding.nameEditText.setText(medicalInfo.fullName)
+            binding.ageEditText.setText(medicalInfo.age)
+            binding.medicalConditionsEditText.setText(medicalInfo.medicalConditions)
+            binding.emergencyContactEditText.setText(medicalInfo.emergencyContact)
+            
+            // Set blood group spinner
+            val bloodGroups = arrayOf("Select", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-")
+            val bloodGroupIndex = bloodGroups.indexOf(medicalInfo.bloodGroup)
+            if (bloodGroupIndex >= 0) {
+                binding.bloodGroupSpinner.setSelection(bloodGroupIndex)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating medical info display", e)
+        }
+    }
+
+    private fun saveMedicalInfo() {
+        try {
+            val selectedBloodGroup = if (binding.bloodGroupSpinner.selectedItem != null) {
+                binding.bloodGroupSpinner.selectedItem.toString()
+            } else {
+                "Select"
+            }
+            
+            val medicalInfo = MedicalInfo(
+                fullName = binding.nameEditText.text.toString().trim(),
+                age = binding.ageEditText.text.toString().trim(),
+                bloodGroup = selectedBloodGroup,
+                medicalConditions = binding.medicalConditionsEditText.text.toString().trim(),
+                emergencyContact = binding.emergencyContactEditText.text.toString().trim()
+            )
+            medicalDataManager.saveMedicalInfo(medicalInfo)
+            Log.i(TAG, "Medical info saved successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving medical info", e)
+        }
+    }
+
+    private fun saveBloodGroup(bloodGroup: String) {
+        try {
+            val currentInfo = medicalDataManager.getMedicalInfo()
+            val updatedInfo = currentInfo.copy(bloodGroup = bloodGroup)
+            medicalDataManager.saveMedicalInfo(updatedInfo)
+            Log.i(TAG, "Blood group saved: $bloodGroup")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving blood group", e)
+        }
+    }
+
+    private fun toggleSiren() {
+        try {
+            if (audioManager.isPlaying()) {
+                audioManager.stopSiren()
+                binding.sirenStatus.text = "Siren: OFF"
+                binding.sirenStatus.setTextColor(ContextCompat.getColor(this, android.R.color.darker_gray))
+            } else {
+                audioManager.startSiren()
+                binding.sirenStatus.text = "Siren: ON"
+                binding.sirenStatus.setTextColor(ContextCompat.getColor(this, android.R.color.holo_red_dark))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error toggling siren", e)
+        }
+    }
+
+    private fun enableEmergencyButton() {
+        try {
+            binding.sosButton.isEnabled = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error enabling emergency button", e)
+        }
+    }
+
+    private fun showSuccessNotification(title: String, message: String) {
+        try {
+            val notificationPayload = EmergencyPayload(
+                name = title,
+                age = null,
+                phone = null,
+                bloodGroup = null,
+                phoneBattery = null,
+                latitude = 0.0,
+                longitude = 0.0,
+                message = message,
+                currentMedicalIssue = message
+            )
+            emergencyNotificationManager.showEmergencyForwardedNotification(notificationPayload)
+            Toast.makeText(this, "$title: $message", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing success notification", e)
+        }
+    }
+
+    private fun showErrorNotification(title: String, message: String) {
+        try {
+            Log.e(TAG, "Error notification: $title - $message")
+            Toast.makeText(this, "$title: $message", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing error notification", e)
+        }
+    }
+
+    private fun updateLastEmergencyTime() {
+        try {
+            val currentTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+            Log.i(TAG, "Last emergency time: $currentTime")
+            updateEmergencyStatus("Last alert: $currentTime", android.R.color.holo_green_dark)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating last emergency time", e)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        try {
+            updateDeviceStatus()
+            val medicalInfo = medicalDataManager.getMedicalInfo()
+            updateMedicalInfoDisplay(medicalInfo)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in onResume", e)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            Log.i(TAG, "Cleaning up resources")
+            // DeviceStatusMonitor doesn't have stopMonitoring method
+            audioManager.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in onDestroy", e)
+        }
+    }
+}
