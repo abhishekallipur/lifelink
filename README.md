@@ -53,8 +53,7 @@ LifeLink ensures **no one is ever truly disconnected**.
 - **Language:** Kotlin  
 - **Framework:** Android SDK + Jetpack Components  
 - **Networking:** Bluetooth Mesh + Internet Fallback  
-- **Database:** Room (SQLite)  
-- **Backend (optional):** Firebase / REST API  
+- **Database:** Room (SQLite) 
 - **Libraries:** Retrofit, Coroutines, ViewModel, LiveData  
 
 ---
